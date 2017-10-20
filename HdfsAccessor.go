@@ -7,14 +7,17 @@ import (
 	"errors"
 	"fmt"
 	"github.com/colinmarc/hdfs"
+	"github.com/colinmarc/hdfs/rpc"
 	"github.com/colinmarc/hdfs/protocol/hadoop_hdfs"
 	"io"
+	"net"
 	"os"
 	"os/user"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
+	"log"
 )
 
 // Interface for accessing HDFS
@@ -128,6 +131,7 @@ func (this *hdfsAccessorImpl) OpenRead(path string) (ReadSeekCloser, error) {
 	}
 	reader, err := this.MetadataClient.Open(path)
 	if err != nil {
+		this.handleClientError(err)
 		return nil, err
 	}
 	return NewHdfsReader(reader), nil
@@ -144,6 +148,7 @@ func (this *hdfsAccessorImpl) CreateFile(path string, mode os.FileMode) (HdfsWri
 	}
 	writer, err := this.MetadataClient.CreateFile(path, 3, 64*1024*1024, mode)
 	if err != nil {
+		this.handleClientError(err)
 		return nil, err
 	}
 
@@ -161,13 +166,11 @@ func (this *hdfsAccessorImpl) ReadDir(path string) ([]Attrs, error) {
 	}
 	files, err := this.MetadataClient.ReadDir(path)
 	if err != nil {
+		this.handleClientError(err)
 		if IsSuccessOrBenignError(err) {
 			// benign error (e.g. path not found)
 			return nil, err
 		}
-		// We've got error from this client, setting to nil, so we try another one next time
-		this.MetadataClient = nil
-		// TODO: attempt to gracefully close the conenction
 		return nil, err
 	}
 	allAttrs := make([]Attrs, len(files))
@@ -190,13 +193,11 @@ func (this *hdfsAccessorImpl) Stat(path string) (Attrs, error) {
 
 	fileInfo, err := this.MetadataClient.Stat(path)
 	if err != nil {
+		this.handleClientError(err)
 		if IsSuccessOrBenignError(err) {
 			// benign error (e.g. path not found)
 			return Attrs{}, err
 		}
-		// We've got error from this client, setting to nil, so we try another one next time
-		this.MetadataClient = nil
-		// TODO: attempt to gracefully close the conenction
 		return Attrs{}, err
 	}
 	return this.AttrsFromFileInfo(fileInfo), nil
@@ -208,6 +209,7 @@ func (this *hdfsAccessorImpl) StatFs() (FsInfo, error) {
 	defer this.MetadataClientMutex.Unlock()
 
 	if this.MetadataClient == nil {
+		log.Println("paverma Trying to create client in StatFS")
 		if err := this.ConnectMetadataClient(); err != nil {
 			return FsInfo{}, err
 		}
@@ -215,10 +217,10 @@ func (this *hdfsAccessorImpl) StatFs() (FsInfo, error) {
 
 	fsInfo, err := this.MetadataClient.StatFs()
 	if err != nil {
+		this.handleClientError(err)
 		if IsSuccessOrBenignError(err) {
 			return FsInfo{}, err
 		}
-		this.MetadataClient = nil
 		return FsInfo{}, err
 	}
 	return this.AttrsFromFsInfo(fsInfo), nil
@@ -294,60 +296,62 @@ func IsSuccessOrBenignError(err error) bool {
 
 // Creates a directory
 func (this *hdfsAccessorImpl) Mkdir(path string, mode os.FileMode) error {
-	this.MetadataClientMutex.Lock()
-	defer this.MetadataClientMutex.Unlock()
-	if this.MetadataClient == nil {
-		if err := this.ConnectMetadataClient(); err != nil {
-			return err
+	return this.handleOperation(func() error {
+		err := this.MetadataClient.Mkdir(path, mode)
+		if err != nil {
+			if strings.HasSuffix(err.Error(), "file already exists") {
+				err = fuse.EEXIST
+			}
 		}
-	}
-	err := this.MetadataClient.Mkdir(path, mode)
-	if err != nil {
-		if strings.HasSuffix(err.Error(), "file already exists") {
-			err = fuse.EEXIST
-		}
-	}
-	return err
+		return err
+	})
 }
 
 // Removes file or directory
 func (this *hdfsAccessorImpl) Remove(path string) error {
-	this.MetadataClientMutex.Lock()
-	defer this.MetadataClientMutex.Unlock()
-	if this.MetadataClient == nil {
-		if err := this.ConnectMetadataClient(); err != nil {
-			return err
-		}
-	}
-	return this.MetadataClient.Remove(path)
+	return this.handleOperation(func() error {
+		return this.MetadataClient.Remove(path)
+	})
 }
 
 // Renames file or directory
 func (this *hdfsAccessorImpl) Rename(oldPath string, newPath string) error {
-	this.MetadataClientMutex.Lock()
-	defer this.MetadataClientMutex.Unlock()
-	if this.MetadataClient == nil {
-		if err := this.ConnectMetadataClient(); err != nil {
-			return err
-		}
-	}
-	return this.MetadataClient.Rename(oldPath, newPath)
+	return this.handleOperation(func() error {
+		return this.MetadataClient.Rename(oldPath, newPath)
+	})
 }
 
 // Changes the mode of the file
 func (this *hdfsAccessorImpl) Chmod(path string, mode os.FileMode) error {
-	this.MetadataClientMutex.Lock()
-	defer this.MetadataClientMutex.Unlock()
-	if this.MetadataClient == nil {
-		if err := this.ConnectMetadataClient(); err != nil {
-			return err
-		}
-	}
-	return this.MetadataClient.Chmod(path, mode)
+	return this.handleOperation(func() error {
+		return this.MetadataClient.Chmod(path, mode)
+	})
 }
 
 // Changes the owner and group of the file
 func (this *hdfsAccessorImpl) Chown(path string, user, group string) error {
+	return this.handleOperation(func() error {
+		return this.MetadataClient.Chown(path, user, group)
+	})
+}
+
+// Handles errors returned from hdfs client.
+func (this *hdfsAccessorImpl) handleClientError(err error) {
+	switch err.(type) {
+	case net.Error:
+		log.Println("paverma found network error.")
+		// Network error, so reset the client.
+		this.MetadataClient = nil
+	case *rpc.NamenodeError:
+		log.Println("paverma found namenode error.")
+		// Namenode threw an error, pessimistically reset the client.
+		this.MetadataClient.Close()
+		this.MetadataClient = nil
+	}
+}
+
+// Helper method to handle simple operations (ones that only return an error).
+func (this *hdfsAccessorImpl) handleOperation(operation func() error) error {
 	this.MetadataClientMutex.Lock()
 	defer this.MetadataClientMutex.Unlock()
 	if this.MetadataClient == nil {
@@ -355,5 +359,9 @@ func (this *hdfsAccessorImpl) Chown(path string, user, group string) error {
 			return err
 		}
 	}
-	return this.MetadataClient.Chown(path, user, group)
+	err := operation()
+	if err != nil {
+		this.handleClientError(err)
+	}
+	return err
 }
